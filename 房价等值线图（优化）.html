@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>上海新房房价等高线图 (稳定交互版)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: "Microsoft YaHei", Arial, sans-serif; }
+        #map { height: 100vh; width: 100%; }
+        
+        #control-panel {
+            position: absolute; top: 20px; right: 20px; z-index: 1000;
+            background: rgba(255, 255, 255, 0.95); padding: 18px; border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15); width: 260px;
+        }
+        h3 { margin-top: 0; color: #333; font-size: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 12px; }
+        .form-group { margin-bottom: 12px; font-size: 13px; color: #444; }
+        .form-group input[type="number"] { width: 60px; padding: 4px; border: 1px solid #ccc; border-radius: 4px; }
+        .btn { background: #1890ff; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 13px; margin-top: 5px; }
+        .btn:hover { background: #40a9ff; }
+
+        .legend-panel {
+            background: rgba(255, 255, 255, 0.9); padding: 12px 16px; border-radius: 8px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.2); line-height: 22px; color: #333;
+            font-size: 12px; min-width: 110px; border: 1px solid #ddd;
+            max-height: 400px; overflow-y: auto;
+        }
+        .legend-title { font-weight: bold; margin-bottom: 6px; font-size: 14px; }
+        .legend-unit { font-size: 11px; color: #666; margin-bottom: 10px; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 4px; }
+        .legend-color { width: 16px; height: 16px; border-radius: 3px; margin-right: 8px; display: inline-block; opacity: 0.85; }
+
+        /* ==========================================
+           【彻底去除背景】使用外发光模拟“断线”效果
+           ========================================== */
+        .isoline-label {
+            background: transparent !important; /* 彻底透明 */
+            border: none !important;            /* 去除边框 */
+            box-shadow: none !important;        /* 去除阴影 */
+            pointer-events: none !important;
+            font-size: 12px;
+            color: #d32f2f;                     /* 醒目的深红色数字 */
+            font-weight: 900;
+            /* 白色发光特效，用来强行挡住文字底下的等值线，形成断开的错觉 */
+            text-shadow: 
+                -1.5px -1.5px 0 #fff,  
+                 1.5px -1.5px 0 #fff,
+                -1.5px  1.5px 0 #fff,
+                 1.5px  1.5px 0 #fff,
+                 0px    0px   4px #fff; 
+            white-space: nowrap;
+        }
+        .isoline-label::before { display: none; } 
+    </style>
+</head>
+<body>
+
+<div id="control-panel">
+    <h3>房价等高线自动分析系统</h3>
+    <div class="form-group">
+        <label>1. 导入数据表 (.xlsx):</label>
+        <input type="file" id="excelFileInput" accept=".xlsx, .xls" style="margin-top: 5px; width: 100%;" />
+    </div>
+    <div class="form-group">
+        <label>2. 等值线间隔 (万元): 
+            <input type="number" id="intervalInput" value="2" step="0.5" min="0.5" />
+        </label>
+    </div>
+    <button class="btn" id="recalcBtn">重新生成等值线</button>
+</div>
+
+<div id="map"></div>
+
+<script>
+    const map = L.map('map', { zoomControl: false }).setView([31.2304, 121.4737], 10);
+    L.tileLayer('https://wprd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&style=7&x={x}&y={y}&z={z}', {
+        subdomains: ['1', '2', '3', '4'], attribution: '&copy; 高德地图', maxZoom: 18
+    }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    let isobandLayer = null;  
+    let isolineLayer = null;  
+    let boundaryLayer = null; 
+    let shanghaiGeoJSON = null; 
+    let globalPoints = null;  
+    let legendControl = null;
+    let highlightedPrices = new Set(); 
+
+    const colorPalette = ['#b9c3e3', '#93b4e7', '#93ebd3', '#d0f597', '#fee192', '#ffa763', '#f76868', '#d35384', '#9e2a5e'];
+
+    // 加载边界
+    fetch("https://geo.datav.aliyun.com/areas_v3/bound/310000.json")
+        .then(response => response.json())
+        .then(geojson => {
+            shanghaiGeoJSON = geojson;
+            boundaryLayer = L.geoJSON(geojson, {
+                style: { color: '#ff4d4f', weight: 1.5, fillOpacity: 0, dashArray: '5, 5' },
+                interactive: false // 保证边界不会阻挡点击
+            }).addTo(map);
+        }).catch(err => console.error("上海边界加载失败:", err));
+
+    // 解析 Excel
+    document.getElementById('excelFileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const data = new Uint8Array(e.target.result);
+            const workbook = XLSX.read(data, { type: 'array' });
+            const sheetData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1 });
+            extractPointsFromExcel(sheetData);
+        };
+        reader.readAsArrayBuffer(file);
+    });
+
+    document.getElementById('recalcBtn').addEventListener('click', function() {
+        if (!globalPoints) return alert("请先导入 Excel 数据表！");
+        renderMapLayers();
+    });
+
+    function extractPointsFromExcel(data) {
+        let headerRowIndex = -1;
+        for (let i = 0; i < data.length; i++) {
+            if (data[i] && data[i].includes("项目经度") && data[i].includes("25-26年成交均价")) {
+                headerRowIndex = i; break;
+            }
+        }
+        if (headerRowIndex === -1) return alert("未找到有效表头！");
+
+        const headers = data[headerRowIndex];
+        const lngIdx = headers.indexOf("项目经度");
+        const latIdx = headers.indexOf("项目纬度");
+        const priceIdx = headers.indexOf("25-26年成交均价");
+
+        let pointsArray = [];
+        for (let i = headerRowIndex + 1; i < data.length; i++) {
+            const row = data[i];
+            if (!row) continue;
+            const lng = parseFloat(row[lngIdx]);
+            const lat = parseFloat(row[latIdx]);
+            const price = parseFloat(row[priceIdx]);
+            if (!isNaN(lng) && !isNaN(lat) && !isNaN(price) && price > 0) {
+                pointsArray.push(turf.point([lng, lat], { price: price }));
+            }
+        }
+        globalPoints = turf.featureCollection(pointsArray);
+        renderMapLayers(); 
+    }
+
+    function renderMapLayers() {
+        if (!shanghaiGeoJSON) return alert("边界数据尚未加载完成，请稍后。");
+        
+        const intervalW = parseFloat(document.getElementById('intervalInput').value); 
+        if (isNaN(intervalW) || intervalW <= 0) return alert("间隔必须为正数！");
+        
+        const interval = intervalW * 10000;
+        let maxPrice = 0;
+        turf.propEach(globalPoints, function(prop) {
+            if (prop.price > maxPrice) maxPrice = prop.price;
+        });
+        
+        let priceBreaks = [];
+        for (let p = 0; p <= (maxPrice + interval); p += interval) {
+            priceBreaks.push(p);
+        }
+
+        function getDynamicColor(minPriceStr) {
+            const minPrice = parseFloat(minPriceStr);
+            const ratio = minPrice / maxPrice;
+            let index = Math.floor(ratio * colorPalette.length);
+            if (index >= colorPalette.length) index = colorPalette.length - 1;
+            if (index < 0) index = 0;
+            return colorPalette[index];
+        }
+
+        const grid = turf.interpolate(globalPoints, 0.6, { 
+            gridType: 'points', property: 'price', units: 'kilometers', weight: 2.5 
+        });
+        const shanghaiPoly = shanghaiGeoJSON.features[0];
+
+        if (isobandLayer) map.removeLayer(isobandLayer);
+        if (isolineLayer) map.removeLayer(isolineLayer);
+
+        // ==========================================
+        // 1. 生成底层彩色等值面 (依然精确裁剪)
+        // ==========================================
+        const rawIsobands = turf.isobands(grid, priceBreaks, { zProperty: 'price' });
+        let clippedBands = [];
+        rawIsobands.features.forEach(function(feat) {
+            try {
+                let intersected = turf.intersect(feat, shanghaiPoly);
+                if (intersected && intersected.geometry) {
+                    intersected.properties = feat.properties; 
+                    clippedBands.push(intersected);
+                }
+            } catch (err) {}
+        });
+
+        isobandLayer = L.geoJSON(turf.featureCollection(clippedBands), {
+            style: function (feature) {
+                const minPrice = feature.properties.price.split('-')[0];
+                return {
+                    fillColor: getDynamicColor(minPrice),
+                    fillOpacity: 0.70, 
+                    weight: 0,         
+                    interactive: false // 重点！底层色块不可点击，鼠标事件直接穿透到底下的线
+                };
+            }
+        }).addTo(map);
+
+        // ==========================================
+        // 2. 生成等值线 (放弃引发崩溃的裁剪，直接解构保留)
+        // ==========================================
+        const rawIsolines = turf.isolines(grid, priceBreaks, { zProperty: 'price' });
+        let validLines = [];
+        
+        // 彻底炸开每一个闭环，保证每一个圈都能拥有自己的独立数字标签！
+        turf.flatten(rawIsolines).features.forEach(function(flatFeat) {
+            validLines.push(flatFeat); // 直接保留，不执行 turf.intersect，彻底告别崩溃！
+        });
+
+        isolineLayer = L.geoJSON(turf.featureCollection(validLines), {
+            
+            renderer: L.canvas({
+        tolerance: 8      // 可以改成8、10、12试试
+    }),
+
+            style: function(feature) {
+                return {
+                    color: "#555",     
+                    weight: 1.5,       
+                    opacity: 0.8,
+                    dashArray: "4, 4"  
+                };
+            },
+            onEachFeature: function (feature, layer) {
+
+                // 添加标签
+                const priceNum = parseFloat(feature.properties.price);
+                if (priceNum > 0) { 
+                    const priceLabel = (priceNum / 10000) + "万";
+                    layer.bindTooltip(priceLabel, {
+                        permanent: true,       
+                        direction: 'center',   
+                        className: 'isoline-label' 
+                    });
+                }
+
+                // ==========================================
+                // 3. 点击交互：支持多条线独立开关 (Toggle)
+                // ==========================================
+                layer.options.isCustomHighlighted = false; // 初始化状态
+
+                // 鼠标移上去变成小手，提示可点击
+                layer.on('mouseover', function() {
+                    layer.getElement().style.cursor = 'pointer';
+                });
+
+                
+                layer.on("click", function (e) {
+
+                if (e.originalEvent) {
+                    L.DomEvent.stopPropagation(e.originalEvent);
+                }
+
+                const currentPrice = Number(feature.properties.price).toFixed(0);
+
+                // 切换当前价格是否高亮
+                if (highlightedPrices.has(currentPrice)) {
+                    highlightedPrices.delete(currentPrice);
+                } else {
+                    highlightedPrices.add(currentPrice);
+                }
+
+                // 更新所有等值线样式
+                isolineLayer.eachLayer(function (l) {
+
+                    const p = Number(l.feature.properties.price).toFixed(0);
+
+                    if (highlightedPrices.has(p)) {
+
+                        l.setStyle({
+                            color: "#ff0000",
+                            weight: 3.5,
+                            opacity: 1,
+                            dashArray: null
+                        });
+
+                        l.bringToFront();
+
+                    } else {
+
+                        l.setStyle({
+                            color: "#555",
+                            weight: 1.5,
+                            opacity: 0.8,
+                            dashArray: "4,4"
+                        });
+
+                    }
+
+                });
+
+                });
+            }
+        }).addTo(map);
+
+        updateLegend(priceBreaks, getDynamicColor);
+    }
+
+    function updateLegend(breaks, colorFn) {
+        if (legendControl) map.removeControl(legendControl);
+        
+        legendControl = L.control({ position: 'bottomleft' });
+        legendControl.onAdd = function () {
+            const div = L.DomUtil.create('div', 'legend-panel');
+            let html = `<div class="legend-title">动态图例</div>
+                        <div class="legend-unit">(单位: 万/㎡)</div>`;
+            
+            for (let i = 0; i < breaks.length - 1; i++) {
+                const minP = breaks[i];
+                const maxP = breaks[i+1];
+                if (maxP === 0) continue; 
+                const color = colorFn(minP);
+                html += `<div class="legend-item">
+                            <span class="legend-color" style="background:${color}"></span>
+                            <span>${minP/10000} - ${maxP/10000}</span>
+                         </div>`;
+            }
+            div.innerHTML = html;
+            return div;
+        };
+        legendControl.addTo(map);
+    }
+</script>
+</body>
+</html>
