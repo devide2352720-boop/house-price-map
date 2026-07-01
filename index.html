@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>上海新房房价等高线图 (高德实景地图版)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: "Microsoft YaHei", Arial, sans-serif; }
+        #map { height: 100vh; width: 100%; }
+        
+        /* 右上角精简控制面板样式 */
+        #control-panel {
+            position: absolute; top: 20px; right: 20px; z-index: 1000;
+            background: rgba(255, 255, 255, 0.95); padding: 18px; border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15); width: 260px;
+        }
+        h3 { margin-top: 0; color: #333; font-size: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 12px; }
+        .file-input-wrapper { margin-top: 5px; }
+
+        /* 左下角图例组件样式 */
+        .legend-panel {
+            background: rgba(255, 255, 255, 0.9); padding: 12px 16px; border-radius: 8px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.2); line-height: 22px; color: #333;
+            font-size: 13px; min-width: 110px; border: 1px solid #ddd;
+        }
+        .legend-title { font-weight: bold; margin-bottom: 6px; font-size: 14px; }
+        .legend-unit { font-size: 11px; color: #666; margin-bottom: 10px; }
+        .legend-item { display: flex; align-items: center; margin-bottom: 5px; }
+        .legend-color { width: 16px; height: 16px; border-radius: 3px; margin-right: 8px; display: inline-block; opacity: 0.85; }
+    </style>
+</head>
+<body>
+
+<div id="control-panel">
+    <h3>房价等高线自动分析系统</h3>
+    <div class="file-input-wrapper">
+        <input type="file" id="excelFileInput" accept=".xlsx, .xls" />
+    </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+    // 1. 初始化地图，中心点上海
+    const map = L.map('map', { zoomControl: false }).setView([31.2304, 121.4737], 10);
+    
+    // 2. 加载高德常规底图
+    L.tileLayer('https://wprd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&style=7&x={x}&y={y}&z={z}', {
+        subdomains: ['1', '2', '3', '4'],
+        attribution: '&copy; 高德地图',
+        maxZoom: 18
+    }).addTo(map);
+
+    // 将缩放按钮移到右下角
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    let contourLayer = null;       
+    let boundaryLayer = null;      
+    let shanghaiGeoJSON = null;    
+
+    // 3. 预加载上海市边界数据
+    fetch("https://geo.datav.aliyun.com/areas_v3/bound/310000.json")
+        .then(response => response.json())
+        .then(geojson => {
+            shanghaiGeoJSON = geojson;
+            // 绘制上海边界虚线
+            boundaryLayer = L.geoJSON(geojson, {
+                style: { color: '#ff4d4f', weight: 1.5, fillOpacity: 0, dashArray: '5, 5' }
+            }).addTo(map);
+        })
+        .catch(err => console.error("上海边界数据加载失败:", err));
+
+    // 4. 配置价格区间
+    const priceBreaks = [0, 20000, 35000, 45000, 60000, 80000, 100000, 120000, 150000, 600000];
+
+    function getColorByPrice(minPrice) {
+        if (minPrice >= 150000) return '#d35384'; // &ge;15万
+        if (minPrice >= 120000) return '#f76868'; // 12-15万
+        if (minPrice >= 100000) return '#ffa763'; // 10-12万
+        if (minPrice >= 80000)  return '#fee192'; // 8-10万
+        if (minPrice >= 60000)  return '#d0f597'; // 6-8万
+        if (minPrice >= 45000)  return '#93ebd3'; // 4.5-6万
+        if (minPrice >= 35000)  return '#93b4e7'; // 3.5-4.5万
+        if (minPrice >= 20000)  return '#b9c3e3'; // 2-3.5万
+        return '#e2e2e6';                         // &le;2万
+    }
+
+    // 5. 监听并解析 Excel
+    document.getElementById('excelFileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const data = new Uint8Array(e.target.result);
+            const workbook = XLSX.read(data, { type: 'array' });
+            const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+            const sheetData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+            processAndRender(sheetData);
+        };
+        reader.readAsArrayBuffer(file);
+    });
+
+    // 6. 核心数据处理与空间裁剪
+    function processAndRender(data) {
+        let headerRowIndex = -1;
+        for (let i = 0; i < data.length; i++) {
+            const row = data[i];
+            if (row && row.includes("项目经度") && row.includes("项目纬度") && row.includes("25-26年成交均价")) {
+                headerRowIndex = i;
+                break;
+            }
+        }
+
+        if (headerRowIndex === -1) {
+            alert("未找到有效的表头（需包含 项目经度、项目纬度、25-26年成交均价）！");
+            return;
+        }
+
+        const headers = data[headerRowIndex];
+        const lngIdx = headers.indexOf("项目经度");
+        const latIdx = headers.indexOf("项目纬度");
+        const priceIdx = headers.indexOf("25-26年成交均价");
+
+        let pointsArray = [];
+        for (let i = headerRowIndex + 1; i < data.length; i++) {
+            const row = data[i];
+            if (!row) continue;
+            const lng = parseFloat(row[lngIdx]);
+            const lat = parseFloat(row[latIdx]);
+            const price = parseFloat(row[priceIdx]);
+
+            if (!isNaN(lng) && !isNaN(lat) && !isNaN(price) && price > 0) {
+                pointsArray.push(turf.point([lng, lat], { price: price }));
+            }
+        }
+
+        if (pointsArray.length === 0 || !shanghaiGeoJSON) {
+            alert("没有提取到数据，或者上海边界正在加载中，请稍后再试。");
+            return;
+        }
+
+        const points = turf.featureCollection(pointsArray);
+
+        // 6.1 生成插值网格
+        const grid = turf.interpolate(points, 0.6, { 
+            gridType: 'points', property: 'price', units: 'kilometers', weight: 2.5 
+        });
+
+        // 6.2 生成等值面
+        const rawIsobands = turf.isobands(grid, priceBreaks, { zProperty: 'price' });
+
+        // 6.3 矢量裁剪（只保留上海边界内的等值面）
+        let clippedFeatures = [];
+        const shanghaiPoly = shanghaiGeoJSON.features[0]; 
+
+        rawIsobands.features.forEach(function(bandFeature) {
+            try {
+                let intersected = turf.intersect(bandFeature, shanghaiPoly);
+                if (intersected && intersected.geometry) {
+                    intersected.properties = bandFeature.properties; 
+                    clippedFeatures.push(intersected);
+                }
+            } catch (err) {
+                console.warn("局部切片裁剪异常，已跳过:", err);
+            }
+        });
+
+        const finalClippedGeoJSON = turf.featureCollection(clippedFeatures);
+
+        // 7. 渲染到地图
+        if (contourLayer) { map.removeLayer(contourLayer); }
+
+        contourLayer = L.geoJSON(finalClippedGeoJSON, {
+            style: function (feature) {
+                const minPrice = parseInt(feature.properties.price.split('-')[0]);
+                return {
+                    fillColor: getColorByPrice(minPrice),
+                    
+                    // ==========================================
+                    // 【核心参数提示】在此处调整透明度
+                    // 0 为完全透明，1 为完全不透明。现已从 0.45 调高至 0.75，色彩更扎实清晰。
+                    fillOpacity: 0.75, 
+                    // ==========================================
+                    
+                    color: "#666",     // 等高线的边界线条颜色
+                    weight: 0.6,       // 等高线边界线条粗细
+                    opacity: 0.5       // 边界线条自身的透明度
+                };
+            }
+        }).addTo(map);
+    }
+
+    // 8. 添加图例组件
+    const legend = L.control({ position: 'bottomleft' });
+    legend.onAdd = function () {
+        const div = L.DomUtil.create('div', 'legend-panel');
+        div.innerHTML = `
+            <div class="legend-title">图例</div>
+            <div class="legend-unit">(单位: 万/㎡)</div>
+            <div class="legend-item"><span class="legend-color" style="background:#e2e2e6"></span><span>&le;2</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#b9c3e3"></span><span>2-3.5</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#93b4e7"></span><span>3.5-4.5</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#93ebd3"></span><span>4.5-6</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#d0f597"></span><span>6-8</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#fee192"></span><span>8-10</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#ffa763"></span><span>10-12</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#f76868"></span><span>12-15</span></div>
+            <div class="legend-item"><span class="legend-color" style="background:#d35384"></span><span>&ge;15</span></div>
+        `;
+        return div;
+    };
+    legend.addTo(map);
+</script>
+</body>
+</html>
